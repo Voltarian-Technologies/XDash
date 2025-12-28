@@ -33,7 +33,7 @@ setup(
             ],
             "include_files": [
                 "assets/",
-                "docs/"
+                "docs/",
                 "Xenia/",
                 "XDash HDD/",
                 "xdash.config.toml",
