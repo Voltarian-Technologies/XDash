@@ -1,0 +1,1 @@
+System has been set up. Just open the xenia_canary.exe. Load the $flash_dash.xex file through file explorer and it should now just run the NXE Classic (2008) dashboard!

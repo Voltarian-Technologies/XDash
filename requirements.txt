@@ -1,0 +1,6 @@
+cx_Freeze>=6.15.0
+customtkinter>=5.2.0
+Pillow>=10.0.0
+pysdl2>=0.9.15
+pysdl2-dll>=2.32.0
+toml>=0.10.2
