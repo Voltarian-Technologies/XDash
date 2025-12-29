@@ -1,6 +1,6 @@
 
 customtkinter
-PIL
+pillow
 toml
 pywin32
 pysdl2
