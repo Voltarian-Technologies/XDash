@@ -8,7 +8,6 @@ setup(
     options={
         "build_exe": {
             "packages": [
-                # GUI + Core
                 "customtkinter",
                 "tkinter",
                 "PIL",
