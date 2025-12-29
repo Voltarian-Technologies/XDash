@@ -21,7 +21,12 @@ setup(
                 "time",
                 "ctypes",
                 "collections",
-                "pywin32",
+                "win32ui",
+                "win32con",
+                "win32gui",
+                "win32process",
+                "win32api",
+                "mss",
                 "pysdl2",
                 "numpy",
                 "comtypes"
