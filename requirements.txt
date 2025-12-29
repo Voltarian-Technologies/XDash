@@ -1,9 +1,9 @@
-
+cx_Freeze
 customtkinter
 pillow
 toml
 pywin32
 pysdl2
-pysdl-dll
+pysdl2-dll
 numpy
 comtypes
