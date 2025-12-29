@@ -29,7 +29,6 @@ setup(
                 "mss",
                 "sdl2",
                 "sdl2.joystick",
-                "numpy",
                 "comtypes"
             ],
             "include_files": [

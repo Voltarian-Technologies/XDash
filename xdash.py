@@ -17,7 +17,6 @@ import win32api
 import win32con
 import mss
 import win32ui
-import numpy as np
 
 # Try to import SDL2 for DirectInput support
 try:
