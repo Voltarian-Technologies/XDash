@@ -1,9 +1,15 @@
 from cx_Freeze import setup, Executable
+import os
+
+
+VERSION = os.getenv("VERSION", "0.0.0")
 
 setup(
     name="XDash",
+    version=VERSION,
     description="Manage your Xbox 360 Content for Xenia Canary Emulator with ease.",
     author="VoltacceptYT, Xenia Contributors",
+    license="MIT",
     executables=[Executable("xdash.py", base="gui", icon="assets/icon.ico", target_name="XDash.exe")],
     options={
         "build_exe": {

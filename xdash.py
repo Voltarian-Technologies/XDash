@@ -2009,8 +2009,10 @@ class App(ctk.CTk):
         elif isinstance(widget, ctk.CTkComboBox):
             widget.focus()
         elif isinstance(widget, ctk.CTkCheckBox):
+            # Toggle the checkbox state
             current_value = widget.get()
             widget.select() if not current_value else widget.deselect()
+            self.toggle_exe_mode()
     
     def handle_mouse_click(self, event):
         """Handle mouse clicks to update focus"""
