@@ -27,7 +27,8 @@ setup(
                 "win32process",
                 "win32api",
                 "mss",
-                "pysdl2",
+                "sdl2",
+                "sdl2.joystick",
                 "numpy",
                 "comtypes"
             ],
