@@ -1,18 +1,9 @@
 
 customtkinter
-tkinter
 PIL
-os
-sys
-json
-subprocess
-pathlib
 toml
-threading
-time
-ctypes
-collections
 pywin32
 pysdl2
+pysdl-dll
 numpy
 comtypes
