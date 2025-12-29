@@ -15,4 +15,4 @@ collections
 pywin32
 pysdl2
 numpy
-comtypes"
+comtypes
