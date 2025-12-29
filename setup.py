@@ -24,7 +24,6 @@ setup(
                 "collections",
                 "pywin32",
                 "pysdl2",
-                "pysdl2-dll",
                 "numpy",
                 "comtypes"
             ],
