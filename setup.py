@@ -26,6 +26,7 @@ setup(
                 "win32gui",
                 "win32process",
                 "win32api",
+                "mss",
                 "sdl2",
                 "sdl2.joystick",
                 "numpy",

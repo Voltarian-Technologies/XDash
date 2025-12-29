@@ -7,3 +7,4 @@ pysdl2
 pysdl2-dll
 numpy
 comtypes
+mss
