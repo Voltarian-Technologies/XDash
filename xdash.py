@@ -11,12 +11,17 @@ import threading
 import time
 import ctypes
 from ctypes import wintypes, byref
-from collections import deque
+import win32gui
+import win32process
+import win32api
+import win32con
+import mss
+import win32ui
+import numpy as np
 
 # Try to import SDL2 for DirectInput support
 try:
     import sdl2
-    import sdl2.ext
     import sdl2.joystick as sdljoystick
     SDL2_AVAILABLE = True
 except ImportError:
@@ -75,6 +80,283 @@ XInputSetState = XINPUT_DLL.XInputSetState
 XInputSetState.argtypes = [wintypes.DWORD, ctypes.POINTER(XINPUT_VIBRATION)]
 XInputSetState.restype = wintypes.DWORD
 
+class WindowCapture:
+    """Enhanced window capture using Windows APIs for off-screen windows"""
+    
+    def __init__(self):
+        self.capturing = False
+        self.capture_thread = None
+        self.target_hwnd = None
+        self.callback = None
+        self.fps = 60
+        self.frame_time = 1.0 / self.fps
+        self.print_window_available = hasattr(ctypes.windll.user32, 'PrintWindow')
+        
+        if self.print_window_available:
+            print("PrintWindow API available for window capture")
+        else:
+            print("PrintWindow API not available, using fallback methods")
+    
+    def get_window_rect(self, hwnd):
+        """Get window rectangle including borders and title bar"""
+        try:
+            # Get window rect
+            rect = win32gui.GetWindowRect(hwnd)
+            
+            # Check if window is minimized
+            if win32gui.IsIconic(hwnd):
+                # Get the restored window position from window placement
+                placement = win32gui.GetWindowPlacement(hwnd)
+                if placement[1] == win32con.SW_SHOWMINIMIZED:
+                    rect = placement[4]  # Normal position rect
+            
+            return rect
+        except:
+            return None
+    
+    def capture_window_mss(self, hwnd):
+        """Method 1: Capture using MSS (works for on-screen windows)"""
+        try:
+            rect = self.get_window_rect(hwnd)
+            if not rect:
+                return None
+            
+            # Convert rect to monitor index
+            monitor = {
+                "top": rect[1],
+                "left": rect[0],
+                "width": rect[2] - rect[0],
+                "height": rect[3] - rect[1]
+            }
+            
+            # Create MSS instance in the current thread
+            with mss.mss() as sct:
+                # Capture the region
+                screenshot = sct.grab(monitor)
+                
+                # Convert to PIL Image
+                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+                return img
+        except Exception as e:
+            return None
+    
+    def capture_window_printwindow(self, hwnd):
+        """Method 2: Capture using PrintWindow API (works for off-screen windows)"""
+        try:
+            # Get window dimensions
+            rect = win32gui.GetWindowRect(hwnd)
+            width = rect[2] - rect[0]
+            height = rect[3] - rect[1]
+            
+            if width <= 0 or height <= 0:
+                return None
+            
+            # Get window device context
+            hwnd_dc = win32gui.GetWindowDC(hwnd)
+            
+            # Create memory DC
+            mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc = mfc_dc.CreateCompatibleDC()
+            
+            # Create bitmap
+            save_bitmap = win32ui.CreateBitmap()
+            save_bitmap.CreateCompatibleBitmap(mfc_dc, width, height)
+            
+            # Select bitmap into DC
+            save_dc.SelectObject(save_bitmap)
+            
+            # Use PrintWindow with PW_RENDERFULLCONTENT flag (works for layered windows)
+            # PW_RENDERFULLCONTENT = 0x00000002
+            result = ctypes.windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 2)
+            
+            if result == 1:
+                # Get bitmap info
+                bmpinfo = save_bitmap.GetInfo()
+                bmpstr = save_bitmap.GetBitmapBits(True)
+                
+                # Create PIL Image from bitmap data
+                img = Image.frombuffer(
+                    'RGB',
+                    (bmpinfo['bmWidth'], bmpinfo['bmHeight']),
+                    bmpstr, 'raw', 'BGRX', 0, 1
+                )
+                
+                # Cleanup
+                win32gui.DeleteObject(save_bitmap.GetHandle())
+                save_dc.DeleteDC()
+                mfc_dc.DeleteDC()
+                win32gui.ReleaseDC(hwnd, hwnd_dc)
+                
+                return img
+            
+            # Cleanup on failure
+            win32gui.DeleteObject(save_bitmap.GetHandle())
+            save_dc.DeleteDC()
+            mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            
+            return None
+            
+        except Exception as e:
+            print(f"PrintWindow capture error: {e}")
+            return None
+    
+    def capture_window_dwm(self, hwnd):
+        """Method 3: Try DWM thumbnail API (for Windows Aero)"""
+        try:
+            # Import DWM API
+            dwmapi = ctypes.windll.dwmapi
+            DWM_TNP_VISIBLE = 0x8
+            DWM_TNP_RECTDESTINATION = 0x1
+            
+            # Create thumbnail
+            thumb = ctypes.c_void_p()
+            hr = dwmapi.DwmRegisterThumbnail(
+                ctypes.wintypes.HWND(0),  # Destination (we'll capture to memory)
+                ctypes.wintypes.HWND(hwnd),
+                ctypes.byref(thumb)
+            )
+            
+            if hr != 0 or not thumb:
+                return None
+            
+            # Get thumbnail properties
+            from ctypes import wintypes
+            
+            class DWM_THUMBNAIL_PROPERTIES(ctypes.Structure):
+                _fields_ = [
+                    ("dwFlags", wintypes.DWORD),
+                    ("rcDestination", wintypes.RECT),
+                    ("rcSource", wintypes.RECT),
+                    ("opacity", wintypes.BYTE),
+                    ("fVisible", wintypes.BOOL),
+                    ("fSourceClientAreaOnly", wintypes.BOOL)
+                ]
+            
+            props = DWM_THUMBNAIL_PROPERTIES()
+            props.dwFlags = DWM_TNP_VISIBLE | DWM_TNP_RECTDESTINATION
+            props.fVisible = True
+            
+            # Get window rect
+            rect = win32gui.GetWindowRect(hwnd)
+            props.rcDestination.left = 0
+            props.rcDestination.top = 0
+            props.rcDestination.right = rect[2] - rect[0]
+            props.rcDestination.bottom = rect[3] - rect[1]
+            
+            # Update thumbnail
+            dwmapi.DwmUpdateThumbnailProperties(thumb, ctypes.byref(props))
+            
+            # Note: DWM thumbnail doesn't give us direct pixel access easily
+            # This method is complex and may not be worth implementing fully
+            
+            dwmapi.DwmUnregisterThumbnail(thumb)
+            return None
+            
+        except Exception as e:
+            return None
+    
+    def capture_window(self, hwnd):
+        """Try multiple capture methods to get window content"""
+        # First, ensure window is in a capturable state
+        self._prepare_window_for_capture(hwnd)
+        
+        # Try PrintWindow first (best for off-screen)
+        if self.print_window_available:
+            img = self.capture_window_printwindow(hwnd)
+            if img:
+                return img
+        
+        # Try MSS (good for on-screen windows)
+        img = self.capture_window_mss(hwnd)
+        if img:
+            return img
+        
+        # Last resort: Try alternative methods
+        return None
+    
+    def _prepare_window_for_capture(self, hwnd):
+        """Ensure window is ready to be captured"""
+        try:
+            # Make sure window is not minimized
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+                time.sleep(0.1)  # Give window time to restore
+            
+            # Make sure window is visible (not hidden)
+            if not win32gui.IsWindowVisible(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+            
+            # Force a redraw to update window content
+            win32gui.UpdateWindow(hwnd)
+            
+            # Bring to front without activating (keep focus on our app)
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOPMOST,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | 
+                win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
+            )
+            
+            # Set back to normal z-order but keep visible
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_NOTOPMOST,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE | 
+                win32con.SWP_NOACTIVATE
+            )
+            
+        except Exception as e:
+            print(f"Error preparing window for capture: {e}")
+    
+    def start_capture(self, hwnd, callback):
+        """Start capturing window at specified FPS"""
+        self.target_hwnd = hwnd
+        self.callback = callback
+        self.capturing = True
+        self.capture_thread = threading.Thread(target=self._capture_loop, daemon=True)
+        self.capture_thread.start()
+    
+    def _capture_loop(self):
+        """Main capture loop"""
+        last_capture_time = time.time()
+        consecutive_failures = 0
+        max_failures = 10
+        
+        while self.capturing and self.target_hwnd:
+            try:
+                current_time = time.time()
+                elapsed = current_time - last_capture_time
+                
+                # Wait for next frame time
+                if elapsed < self.frame_time:
+                    time.sleep(self.frame_time - elapsed)
+                
+                # Capture frame
+                img = self.capture_window(self.target_hwnd)
+                if img and self.callback:
+                    self.callback(img)
+                    consecutive_failures = 0
+                else:
+                    consecutive_failures += 1
+                    if consecutive_failures >= max_failures:
+                        print(f"Too many capture failures ({consecutive_failures}). Stopping capture.")
+                        self.stop_capture()
+                
+                last_capture_time = current_time
+                
+            except Exception as e:
+                print(f"Capture loop error: {e}")
+                time.sleep(0.1)
+    
+    def stop_capture(self):
+        """Stop capturing"""
+        self.capturing = False
+        if self.capture_thread:
+            self.capture_thread.join(timeout=2.0)
+
 class ControllerManager:
     """Manages both XInput and DirectInput (SDL) controllers"""
     
@@ -88,7 +370,6 @@ class ControllerManager:
         self.last_state = {}
         self.debounce_time = 0.2  # 200ms debounce for button presses
         self.last_press_time = {}
-        self.enabled = True  # Track if controller input is enabled
         
         # Initialize SDL if needed
         if SDL2_AVAILABLE and controller_type in ["any", "sdl"]:
@@ -156,15 +437,6 @@ class ControllerManager:
     
     def get_controller_state(self, controller_index=0):
         """Get combined controller state from both XInput and SDL"""
-        # Return empty state if controller input is disabled
-        if not self.enabled:
-            return {
-                'buttons': {},
-                'axes': {},
-                'hats': {},
-                'connected': False,
-                'type': None
-            }
             
         state = {
             'buttons': {},
@@ -218,13 +490,14 @@ class ControllerManager:
             
             # Map buttons
             buttons = {
+                'back': bool(gamepad.wButtons & XINPUT_GAMEPAD_BACK),
+                'start': bool(gamepad.wButtons & XINPUT_GAMEPAD_START),
                 'a': bool(gamepad.wButtons & XINPUT_GAMEPAD_A),
                 'b': bool(gamepad.wButtons & XINPUT_GAMEPAD_B),
                 'x': bool(gamepad.wButtons & XINPUT_GAMEPAD_X),
                 'y': bool(gamepad.wButtons & XINPUT_GAMEPAD_Y),
                 'start': bool(gamepad.wButtons & XINPUT_GAMEPAD_START),
                 'back': bool(gamepad.wButtons & XINPUT_GAMEPAD_BACK),
-                'guide': False,  # XInput doesn't have guide button
                 'leftshoulder': bool(gamepad.wButtons & XINPUT_GAMEPAD_LEFT_SHOULDER),
                 'rightshoulder': bool(gamepad.wButtons & XINPUT_GAMEPAD_RIGHT_SHOULDER),
                 'leftstick': bool(gamepad.wButtons & XINPUT_GAMEPAD_LEFT_THUMB),
@@ -270,15 +543,31 @@ class ControllerManager:
             axes = {}
             hats = {}
             
-            # Get button states using SDL_GameControllerGetButton
-            # We'll check common buttons up to 15 (standard controller has up to 15 buttons)
-            for i in range(15):
+            # Get button states using SDL_GameControllerGetButton with proper SDL2 constants
+            button_mapping = {
+                'a': sdl2.SDL_CONTROLLER_BUTTON_A,  # A button
+                'b': sdl2.SDL_CONTROLLER_BUTTON_B,  # B button
+                'x': sdl2.SDL_CONTROLLER_BUTTON_X,  # X button
+                'y': sdl2.SDL_CONTROLLER_BUTTON_Y,  # Y button
+                'back': sdl2.SDL_CONTROLLER_BUTTON_BACK,  # Back/Select
+                'start': sdl2.SDL_CONTROLLER_BUTTON_START,  # Start
+                'leftshoulder': sdl2.SDL_CONTROLLER_BUTTON_LEFTSHOULDER,  # LB
+                'rightshoulder': sdl2.SDL_CONTROLLER_BUTTON_RIGHTSHOULDER,  # RB
+                'leftstick': sdl2.SDL_CONTROLLER_BUTTON_LEFTSTICK,  # Left stick press
+                'rightstick': sdl2.SDL_CONTROLLER_BUTTON_RIGHTSTICK,  # Right stick press
+                'dpup': sdl2.SDL_CONTROLLER_BUTTON_DPAD_UP,  # D-Pad Up
+                'dpdown': sdl2.SDL_CONTROLLER_BUTTON_DPAD_DOWN,  # D-Pad Down
+                'dpleft': sdl2.SDL_CONTROLLER_BUTTON_DPAD_LEFT,  # D-Pad Left
+                'dpright': sdl2.SDL_CONTROLLER_BUTTON_DPAD_RIGHT,  # D-Pad Right
+            }
+            
+            # Check each button in the mapping
+            for btn_name, btn_constant in button_mapping.items():
                 try:
-                    button_state = sdl2.SDL_GameControllerGetButton(controller, i)
-                    if button_state is not None:
-                        buttons[f'button{i}'] = bool(button_state)
+                    button_state = sdl2.SDL_GameControllerGetButton(controller, btn_constant)
+                    buttons[btn_name] = bool(button_state)
                 except:
-                    break
+                    buttons[btn_name] = False
             
             # Get axis states using SDL_GameControllerGetAxis
             # Check common axes up to 6
@@ -298,7 +587,7 @@ class ControllerManager:
                 except:
                     pass
             
-            # Get hat states using joystick interface
+            # Get hat states using joystick interface (fallback for controllers without button D-pad)
             num_hats = sdl2.SDL_JoystickNumHats(joystick)
             for i in range(num_hats):
                 try:
@@ -306,41 +595,6 @@ class ControllerManager:
                     hats[f'hat{i}'] = hat_value
                 except:
                     pass
-            
-            # Map common buttons to consistent names based on standard Xbox layout
-            mapped_buttons = {
-                'a': buttons.get('button0', False),  # A button
-                'b': buttons.get('button1', False),  # B button
-                'x': buttons.get('button2', False),  # X button
-                'y': buttons.get('button3', False),  # Y button
-                'back': buttons.get('button6', False),  # Back/Select
-                'start': buttons.get('button7', False),  # Start
-                'guide': buttons.get('button8', False),  # Guide/Xbox button
-                'leftshoulder': buttons.get('button4', False),  # LB
-                'rightshoulder': buttons.get('button5', False),  # RB
-                'leftstick': buttons.get('button9', False),  # Left stick press
-                'rightstick': buttons.get('button10', False),  # Right stick press
-            }
-            
-            # Map D-pad from hat or buttons
-            if hats:
-                hat_value = next(iter(hats.values()), 0)
-                # SDL hat values are constants
-                hat_up = sdl2.SDL_HAT_UP if hasattr(sdl2, 'SDL_HAT_UP') else 0x01
-                hat_down = sdl2.SDL_HAT_DOWN if hasattr(sdl2, 'SDL_HAT_DOWN') else 0x04
-                hat_left = sdl2.SDL_HAT_LEFT if hasattr(sdl2, 'SDL_HAT_LEFT') else 0x08
-                hat_right = sdl2.SDL_HAT_RIGHT if hasattr(sdl2, 'SDL_HAT_RIGHT') else 0x02
-                
-                mapped_buttons['dpup'] = bool(hat_value & hat_up)
-                mapped_buttons['dpdown'] = bool(hat_value & hat_down)
-                mapped_buttons['dpleft'] = bool(hat_value & hat_left)
-                mapped_buttons['dpright'] = bool(hat_value & hat_right)
-            else:
-                # Try to map from buttons 11-14 (common D-pad mapping)
-                mapped_buttons['dpup'] = buttons.get('button11', False)
-                mapped_buttons['dpdown'] = buttons.get('button12', False)
-                mapped_buttons['dpleft'] = buttons.get('button13', False)
-                mapped_buttons['dpright'] = buttons.get('button14', False)
             
             # Map axes to common names
             mapped_axes = {}
@@ -360,7 +614,7 @@ class ControllerManager:
             
             return {
                 'connected': True,
-                'buttons': mapped_buttons,
+                'buttons': buttons,  # Already mapped with proper names
                 'axes': mapped_axes,
                 'hats': hats,
             }
@@ -429,42 +683,31 @@ class ControllerManager:
                 sdl2.SDL_Quit()
             except:
                 pass
-    
-    def disable_input(self):
-        """Disable controller input processing"""
-        self.enabled = False
-        print("Controller input disabled")
-    
-    def enable_input(self):
-        """Enable controller input processing"""
-        self.enabled = True
-        print("Controller input enabled")
 
 
 class App(ctk.CTk):
     def __init__(self):
         super().__init__()
         # Set appearance mode and default color theme
-        ctk.set_appearance_mode("light")  # Options: "light", "dark", "system"
+        ctk.set_appearance_mode("light")
 
-        # Configure window for fullscreen 1080p
+        # Configure window for 1080p (1920x1080)
         self.title("XDash - Xbox 360 Content Manager for Xenia Canary")
         
-        # Set window to fullscreen 1080p
-        self.geometry("1920x1080")
+        # Set window size to 1080p
+        self.window_width = 1920
+        self.window_height = 1080
         
         # Center window on screen
-        self.update_idletasks()
-        width = self.winfo_screenwidth()
-        height = self.winfo_screenheight()
-        x = (width - 1920) // 2
-        y = (height - 1080) // 2
-        self.geometry(f"1920x1080+{x}+{y}")
+        screen_width = self.winfo_screenwidth()
+        screen_height = self.winfo_screenheight()
+        center_x = int((screen_width - self.window_width) / 2)
+        center_y = int((screen_height - self.window_height) / 2)
         
-        # Remove maximize button, keep minimize and close
+        self.geometry(f"{self.window_width}x{self.window_height}+{center_x}+{center_y}")
         self.resizable(False, False)
         
-        self.configure(fg_color="#f0f3f9")  # Original background color
+        self.configure(fg_color="#f0f3f9")
         
         # Get the script directory
         if getattr(sys, 'frozen', False):
@@ -475,6 +718,10 @@ class App(ctk.CTk):
             self.script_dir = Path(__file__).parent
         
         print(f"Script directory: {self.script_dir}")
+        
+        # Store window dimensions for later use
+        self.window_width = self.window_width
+        self.window_height = self.window_height
         
         # Define paths relative to script directory
         self.xenia_dir = self.script_dir / "Xenia"
@@ -514,7 +761,7 @@ class App(ctk.CTk):
         self.focus_index = 0
         self.focusable_widgets = []
         self.last_controller_input_time = 0
-        self.input_cooldown = 0.2  # 200ms cooldown between inputs
+        self.input_cooldown = 0.2
         
         # Track original widget styles for highlighting
         self.widget_styles = {}
@@ -532,9 +779,18 @@ class App(ctk.CTk):
         self.netplay_mode = tk.BooleanVar(value=self.config.get('netplay', False))
         
         # Track Xenia processes
-        self.xenia_processes = []
-        self.process_check_interval = 2000  # Check every 2 seconds
+        self.xenia_process = None
+        self.xenia_hwnd = None
+        self.process_check_interval = 2000
         self.is_xenia_running = False
+        
+        # Window capture
+        self.window_capture = WindowCapture()
+        self.is_capturing = False
+        
+        # UI elements
+        self.game_display = None
+        self.menu_container = None
         
         # Apply initial executable mode from config BEFORE creating widgets
         self.apply_initial_exe_mode()
@@ -548,7 +804,7 @@ class App(ctk.CTk):
         # Start Xenia process monitoring
         self.monitor_xenia_processes()
         
-        # Bind keyboard shortcuts for navigation (still functional)
+        # Bind keyboard shortcuts for navigation
         self.bind('<Up>', lambda e: self.navigate_focus(-1))
         self.bind('<Down>', lambda e: self.navigate_focus(1))
         self.bind('<Return>', lambda e: self.activate_focused_widget())
@@ -559,6 +815,9 @@ class App(ctk.CTk):
         
         # Bind window focus events
         self.bind('<FocusIn>', lambda e: self.update_focus_display())
+
+        # Bind window close event to quit_app
+        self.protocol("WM_DELETE_WINDOW", self.quit_app)
     
     def load_config(self):
         """Load configuration from TOML file"""
@@ -657,45 +916,54 @@ class App(ctk.CTk):
     
     def create_widgets(self):
         """Create and place all widgets"""
-        # Calculate center position for content (800x900 centered in 1920x1080)
-        content_width = 800
-        content_height = 900
-        x_pos = (1920 - content_width) // 2
-        y_pos = (1080 - content_height) // 2
+        # Create menu container (always present, but can be hidden)
+        self.create_menu_widgets()
         
-        # Main container frame
-        self.main_container = ctk.CTkFrame(self, width=content_width, height=content_height,
-                                          fg_color="#f0f3f9", corner_radius=0)
-        self.main_container.place(x=x_pos, y=y_pos)
+        # Create game display (always present, hidden by default)
+        self.create_game_display()
         
-        # Banner Background - Original white with light gray border
-        self.bannerBackground = ctk.CTkFrame(self.main_container, width=776, height=274, corner_radius=12, 
-                                             fg_color="#ffffff", border_width=1, 
-                                             border_color="#e2e8f0")
+        # Status indicators
+        self.create_status_indicators()
+    
+    def create_menu_widgets(self):
+        """Create menu widgets"""
+        # Main menu container
+        self.menu_container = ctk.CTkFrame(self, width=800, height=900,
+                                        fg_color="#f0f3f9", corner_radius=0)
+        
+        # Center menu on window
+        x_pos = (self.window_width - 800) // 2
+        y_pos = (self.window_height - 900) // 2
+        self.menu_container.place(x=x_pos, y=y_pos)
+        
+        # Banner Background
+        self.bannerBackground = ctk.CTkFrame(self.menu_container, width=776, height=274, corner_radius=12, 
+                                            fg_color="#ffffff", border_width=1, 
+                                            border_color="#e2e8f0")
         self.bannerBackground.place(x=12, y=12)
         
         # Xenia Logo
         self.xeniaLogoFile = self.load_image(str(self.logo_path), (200, 200))
-        self.xeniaLogo = ctk.CTkLabel(self.main_container, image=self.xeniaLogoFile, text="", 
-                                      width=200, height=200, fg_color="#ffffff")
+        self.xeniaLogo = ctk.CTkLabel(self.menu_container, image=self.xeniaLogoFile, text="", 
+                                    width=200, height=200, fg_color="#ffffff")
         self.xeniaLogo.place(x=28, y=36)
         
-        # Title Label - Original gray text
-        self.titleLabel = ctk.CTkLabel(self.main_container, text="XDash                                   ", 
-                                       width=466, height=56, fg_color="#ffffff", 
-                                       text_color="#555555", font=("Arial", 36, "bold"))
+        # Title Label
+        self.titleLabel = ctk.CTkLabel(self.menu_container, text="XDash                                   ", 
+                                    width=466, height=56, fg_color="#ffffff", 
+                                    text_color="#555555", font=("Arial", 36, "bold"))
         self.titleLabel.place(x=245, y=106)
         
-        # Description Label - Original gray text
-        self.descriptionLabel = ctk.CTkLabel(self.main_container, text="Manage your Xbox 360 Content with ease.", 
-                                       width=466, height=24, fg_color="#ffffff", 
-                                       text_color="#555555", font=("Arial", 24, "italic"))
+        # Description Label
+        self.descriptionLabel = ctk.CTkLabel(self.menu_container, text="Manage your Xbox 360 Content with ease.", 
+                                    width=466, height=24, fg_color="#ffffff", 
+                                    text_color="#555555", font=("Arial", 24, "italic"))
         self.descriptionLabel.place(x=245, y=150)
         
-        # Content Selection Frame - Original white with light gray border
-        self.selectionFrame = ctk.CTkFrame(self.main_container, width=776, height=400, corner_radius=12,
-                                          fg_color="#ffffff", border_width=1, 
-                                          border_color="#e2e8f0")
+        # Content Selection Frame
+        self.selectionFrame = ctk.CTkFrame(self.menu_container, width=776, height=400, corner_radius=12,
+                                        fg_color="#ffffff", border_width=1, 
+                                        border_color="#e2e8f0")
         self.selectionFrame.place(x=12, y=300)
         
         # Check if HDD Content were loaded successfully
@@ -703,24 +971,39 @@ class App(ctk.CTk):
             self.create_error_widgets()
         else:
             self.create_hdd_content_widgets()
-        
+   
+    def create_game_display(self):
+        """Create game display that will show embedded Xenia"""
+        # Game display frame (full window)
+        self.game_display = ctk.CTkLabel(
+            self,
+            text="",
+            fg_color="black"
+        )
+        # Will be shown when game launches
+        self.game_display.place_forget()
+    
+    def create_status_indicators(self):
+        """Create status indicators"""
         # Controller status indicator
         self.controller_status = ctk.CTkLabel(
-            self.main_container,
+            self.menu_container,
             text="Controller: Disconnected",
             text_color="#6b7280",
             font=("Arial", 10)
         )
-        self.controller_status.place(x=20, y=content_height - 30)
+        self.controller_status.place(x=20, y=870)
         
-        # Xenia running status indicator
-        self.xenia_status = ctk.CTkLabel(
-            self.main_container,
-            text="Xenia: Not Running",
-            text_color="#6b7280",
-            font=("Arial", 10)
+        # Game status indicator (shown when game is running)
+        self.game_status = ctk.CTkLabel(
+            self,
+            text="  Press Back + Start Buttons to Exit Game  ",
+            text_color="#555555",
+            corner_radius=8,
+            font=("Arial", 16),
+            fg_color="#f0f3f9"
         )
-        self.xenia_status.place(x=content_width - 150, y=content_height - 30)
+        self.game_status.place_forget()  # Hidden initially
     
     def create_error_widgets(self):
         """Create widgets for when no HDD Content are found"""
@@ -731,7 +1014,7 @@ class App(ctk.CTk):
         self.errorLabel = ctk.CTkLabel(
             self.selectionFrame,
             text=f"{error_icon}\nNO HDD CONTENT FOUND",
-            text_color="#dc2626",  # Red for errors
+            text_color="#dc2626",
             font=("Arial", 24, "bold"),
             justify="center"
         )
@@ -754,7 +1037,7 @@ class App(ctk.CTk):
         )
         self.instructionsLabel.place(relx=0.5, rely=0.6, anchor="center")
         
-        # Retry button - Modern design
+        # Retry button
         self.retryButton = ctk.CTkButton(
             self.selectionFrame,
             text="Retry Load",
@@ -787,9 +1070,9 @@ class App(ctk.CTk):
     
     def create_hdd_content_widgets(self):
         """Create widgets for when HDD Content are loaded successfully"""
-        # Content Selection Label with modern styling
+        # Content Selection Label
         self.selectionLabel = ctk.CTkLabel(self.selectionFrame, text="Select Content",
-                                          text_color="#374151",  # Darker gray for better contrast
+                                          text_color="#374151",
                                           font=("Arial", 26, "bold"),
                                           anchor="w")
         self.selectionLabel.place(x=30, y=25)
@@ -800,7 +1083,7 @@ class App(ctk.CTk):
         # Mode selection checkboxes
         self.create_mode_checkboxes()
         
-        # Launch Button with modern gradient-like effect
+        # Launch Button
         self.launchButton = ctk.CTkButton(
             self.selectionFrame,
             text="Launch Content",
@@ -838,7 +1121,7 @@ class App(ctk.CTk):
     
     def create_rom_selection_row(self):
         """Create the HDD content selection dropdown with set default button"""
-        # Modern Dropdown (Combobox) with enhanced styling
+        # Modern Dropdown (Combobox)
         self.contentDropdown = ctk.CTkComboBox(
             self.selectionFrame,
             values=list(self.hdd_content.keys()),
@@ -990,8 +1273,135 @@ class App(ctk.CTk):
         else:
             self.create_hdd_content_widgets()
     
+    def find_xenia_window(self, process_id):
+        """Find Xenia window by process ID - enhanced version"""
+        def callback(hwnd, hwnds):
+            try:
+                # Get process ID for this window
+                _, found_pid = win32process.GetWindowThreadProcessId(hwnd)
+                if found_pid == process_id:
+                    # Get window class name
+                    class_name = win32gui.GetClassName(hwnd)
+                    title = win32gui.GetWindowText(hwnd)
+                    
+                    # Common Xenia window patterns
+                    is_xenia_window = (
+                        "xenia" in title.lower() or 
+                        "Xenia" in title or
+                        title.endswith(".xex") or
+                        "Direct3D" in class_name or
+                        class_name.startswith("WindowsForms10") or
+                        class_name.startswith("SDL_app") or
+                        class_name == "MainWindow" or
+                        "GLFW" in class_name or
+                        len(title) > 0  # Any window with a title from this process
+                    )
+                    
+                    if is_xenia_window:
+                        hwnds.append(hwnd)
+                        return False  # Stop searching when found
+            except:
+                pass
+            return True  # Continue searching
+        
+        hwnds = []
+        win32gui.EnumWindows(callback, hwnds)
+        return hwnds[0] if hwnds else None
+    
+    def move_window_offscreen(self, hwnd):
+        """Move window to off-screen position"""
+        try:
+            # Get screen dimensions
+            screen_width = win32api.GetSystemMetrics(0)
+            screen_height = win32api.GetSystemMetrics(1)
+            
+            # Position window far off-screen (right side)
+            offscreen_x = screen_width + 10000
+            offscreen_y = 100
+            
+            # Move window off-screen
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOP,
+                offscreen_x,
+                offscreen_y,
+                1280,
+                720,
+                win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE
+            )
+            
+            print(f"Moved Xenia window off-screen to: ({offscreen_x}, {offscreen_y})")
+            return True
+        except Exception as e:
+            print(f"Error moving window off-screen: {e}")
+            return False
+    
+    def update_game_display(self, image):
+        """Update the game display with new image"""
+        try:
+            # Resize image to fill the window while maintaining aspect ratio
+            target_width = self.window_width
+            target_height = self.window_height
+            
+            # Calculate aspect ratio preserving resize
+            img_width, img_height = image.size
+            ratio = min(target_width / img_width, target_height / img_height)
+            new_width = int(img_width * ratio)
+            new_height = int(img_height * ratio)
+            
+            # Resize image
+            image = image.resize((new_width, new_height), Image.LANCZOS)
+            
+            # Create a black background image
+            background = Image.new('RGB', (target_width, target_height), (0, 0, 0))
+            
+            # Paste the resized image in the center
+            paste_x = (target_width - new_width) // 2
+            paste_y = (target_height - new_height) // 2
+            background.paste(image, (paste_x, paste_y))
+            
+            # Convert to CTkImage
+            ctk_img = ctk.CTkImage(light_image=background, dark_image=background, 
+                                size=(target_width, target_height))
+            
+            # Update label in main thread
+            self.after(0, lambda: self.game_display.configure(image=ctk_img, text=""))
+            
+        except Exception as e:
+            print(f"Error updating game display: {e}")   
+ 
+    def show_game(self):
+        """Show the game display and hide the menu"""
+        if self.menu_container:
+            self.menu_container.place_forget()
+        
+        if self.game_display:
+            self.game_display.place(x=0, y=0, relwidth=1, relheight=1)
+        
+        if self.game_status:
+            # Show game status at top-left corner
+            self.game_status.place(x=12, y=12)
+        
+        print("Showing game")
+    
+    def show_menu(self):
+        """Show the menu and hide game display"""
+        if self.game_display:
+            self.game_display.place_forget()
+        
+        if self.game_status:
+            self.game_status.place_forget()
+        
+        if self.menu_container:
+            # Re-center menu on window
+            x_pos = (self.window_width - 800) // 2
+            y_pos = (self.window_height - 900) // 2
+            self.menu_container.place(x=x_pos, y=y_pos)
+        
+        print("Showing menu")
+    
     def launch_selected_rom(self):
-        """Launch the selected HDD content with the current executable"""
+        """Launch the selected HDD content with embedding"""
         selected_name = self.selected_hdd_content.get()
         
         if not selected_name or selected_name not in self.hdd_content:
@@ -1004,7 +1414,6 @@ class App(ctk.CTk):
         if not self.current_exe_path.exists():
             error_msg = f"Executable not found: {self.current_exe_path}"
             print(error_msg)
-            # Show error to user
             self.show_error_popup("Executable Not Found", 
                                  f"Cannot find:\n{self.current_exe_path}\n\nPlease ensure the Xenia directory contains the required executable.")
             return
@@ -1017,37 +1426,25 @@ class App(ctk.CTk):
                                  f"Cannot find:\n{selected_rom_path}\n\nPlease check the path in layout.json.")
             return
         
-        # Build the command
-        full_command = f'"{self.current_exe_path}" "{selected_rom_path}"'
+        print(f"Launching: {selected_name}")
+        print(f"Executable: {self.current_exe_path}")
+        print(f"Content: {selected_rom_path}")
         
         try:
-            self.update_idletasks()  # Update UI
-            
-            print(f"Launching: {selected_name}")
-            print(f"Executable: {self.current_exe_path}")
-            print(f"Content: {selected_rom_path}")
-            print(f"Command: {full_command}")
-            
             # Show launching message
             self.show_info_popup("Launching", f"Launching {selected_name}...")
             
-            # Launch the HDD content
-            if os.name == 'nt':  # Windows
-                process = subprocess.Popen(
-                    full_command,
-                    shell=True,
-                    creationflags=subprocess.CREATE_NEW_CONSOLE
-                )
-            else:  # macOS/Linux
-                process = subprocess.Popen(
-                    full_command,
-                    shell=True,
-                    start_new_session=True
-                )
+            # Launch Xenia process
+            self.xenia_process = subprocess.Popen(
+                [str(self.current_exe_path), str(selected_rom_path)],
+                creationflags=subprocess.CREATE_NO_WINDOW
+            )
             
-            # Store the process reference
-            self.xenia_processes.append(process)
-            
+            print(f"Xenia process started with PID: {self.xenia_process.pid}")
+
+            # Setup window capture and show game
+            self.setup_window_capture()
+
             # Close the info popup
             self.destroy_popup()
             
@@ -1057,6 +1454,256 @@ class App(ctk.CTk):
             import traceback
             traceback.print_exc()
             self.show_error_popup("Launch Failed", error_msg)
+    
+    def setup_window_capture(self):
+        """Setup window capture after Xenia launches"""
+        if not self.xenia_process:
+            return
+        
+        try:
+            print(f"Searching for Xenia window (PID: {self.xenia_process.pid})")
+            
+            # Try multiple times to find the window
+            self.xenia_hwnd = None
+            
+            for attempt in range(30):  # 15 seconds total
+                print(f"Attempt {attempt + 1}/30...")
+                
+                # Find window by process ID
+                self.xenia_hwnd = self.find_xenia_window(self.xenia_process.pid)
+                
+                # Alternative: Find by window title
+                if not self.xenia_hwnd:
+                    windows = []
+                    
+                    def enum_windows_callback(hwnd, windows_list):
+                        try:
+                            _, pid = win32process.GetWindowThreadProcessId(hwnd)
+                            if pid == self.xenia_process.pid:
+                                title = win32gui.GetWindowText(hwnd)
+                                class_name = win32gui.GetClassName(hwnd)
+                                
+                                # Look for Xenia window patterns
+                                if (title and ('.xex' in title or 'Xenia' in title or 
+                                            'Direct3D' in class_name or 
+                                            'SDL_app' in class_name)):
+                                    windows_list.append(hwnd)
+                        except:
+                            pass
+                        return True
+                    
+                    win32gui.EnumWindows(enum_windows_callback, windows)
+                    if windows:
+                        self.xenia_hwnd = windows[0]
+                
+                if self.xenia_hwnd:
+                    # Get window info
+                    title = win32gui.GetWindowText(self.xenia_hwnd)
+                    class_name = win32gui.GetClassName(self.xenia_hwnd)
+                    print(f"Found window: '{title}' (Class: {class_name})")
+                    
+                    # Position window off-screen but ensure it's visible and not minimized
+                    self.position_window_for_capture(self.xenia_hwnd)
+                    
+                    # Show game display
+                    self.show_game()
+                    
+                    # Start capturing
+                    self.is_capturing = True
+                    self.window_capture.start_capture(self.xenia_hwnd, self.update_game_display)
+                    print("Window capture started successfully!")
+                    return
+                
+                time.sleep(0.5)
+            
+            print("Failed to find Xenia window")
+            self.show_error_popup("Window Not Found", 
+                                "Could not find Xenia window. The game may have failed to launch.")
+            
+        except Exception as e:
+            print(f"Error setting up capture: {e}")
+            import traceback
+            traceback.print_exc()
+            self.show_error_popup("Capture Setup Failed", str(e))
+
+    def position_window_for_capture(self, hwnd):
+        """Position window for optimal capture (off-screen, borderless, and visible)"""
+        try:
+            # Get screen dimensions
+            screen_width = win32api.GetSystemMetrics(0)
+            screen_height = win32api.GetSystemMetrics(1)
+            
+            # Set window to borderless (no title bar, no borders)
+            self.make_window_borderless(hwnd)
+            
+            # Position window just outside visible area (right side)
+            offscreen_x = screen_width  # Start at screen edge
+            offscreen_y = 0
+            
+            # Ensure window is not minimized
+            if win32gui.IsIconic(hwnd):
+                win32gui.ShowWindow(hwnd, win32con.SW_RESTORE)
+            
+            # Make sure window is visible but not activated
+            win32gui.ShowWindow(hwnd, win32con.SW_SHOWNOACTIVATE)
+            
+            # Set window position and size (borderless fullscreen equivalent)
+            # Use standard 16:9 resolution for compatibility
+            window_width = 1280
+            window_height = 720
+            
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOP,
+                offscreen_x,
+                offscreen_y,
+                window_width,
+                window_height,
+                win32con.SWP_NOZORDER | win32con.SWP_NOACTIVATE | win32con.SWP_SHOWWINDOW
+            )
+            
+            print(f"Positioned borderless Xenia window at: ({offscreen_x}, {offscreen_y}) - Size: {window_width}x{window_height}")
+            
+            # Give window time to reposition
+            time.sleep(0.3)
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error positioning window: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+
+    def make_window_borderless(self, hwnd):
+        """Remove window borders, title bar, and menu bar completely - also remove from taskbar"""
+        try:
+            # Get current window style
+            style = win32gui.GetWindowLong(hwnd, win32con.GWL_STYLE)
+            
+            # Remove ALL window decorations:
+            new_style = style & ~(
+                win32con.WS_CAPTION | 
+                win32con.WS_THICKFRAME | 
+                win32con.WS_SYSMENU |
+                win32con.WS_MINIMIZEBOX |
+                win32con.WS_MAXIMIZEBOX |
+                win32con.WS_BORDER |
+                win32con.WS_DLGFRAME |
+                win32con.WS_OVERLAPPEDWINDOW
+            )
+            
+            # Set to pure popup style (no borders, no title, no menu)
+            new_style = win32con.WS_POPUP | win32con.WS_VISIBLE | win32con.WS_CLIPSIBLINGS | win32con.WS_CLIPCHILDREN
+            
+            # Set new window style
+            win32gui.SetWindowLong(hwnd, win32con.GWL_STYLE, new_style)
+            
+            # Get and modify extended styles
+            ex_style = win32gui.GetWindowLong(hwnd, win32con.GWL_EXSTYLE)
+            
+            # Remove various extended styles
+            ex_style &= ~(
+                win32con.WS_EX_DLGMODALFRAME | 
+                win32con.WS_EX_CLIENTEDGE | 
+                win32con.WS_EX_STATICEDGE |
+                win32con.WS_EX_WINDOWEDGE |
+                win32con.WS_EX_OVERLAPPEDWINDOW |
+                win32con.WS_EX_PALETTEWINDOW |
+                win32con.WS_EX_TOOLWINDOW |
+                win32con.WS_EX_APPWINDOW  # This removes from taskbar!
+            )
+            
+            # Add styles to hide from taskbar and alt+tab
+            ex_style |= (
+                win32con.WS_EX_LAYERED |
+                win32con.WS_EX_TOOLWINDOW  # This also helps hide from taskbar
+            )
+            
+            win32gui.SetWindowLong(hwnd, win32con.GWL_EXSTYLE, ex_style)
+            
+            # Remove window menu if it exists
+            try:
+                hmenu = win32gui.GetMenu(hwnd)
+                if hmenu:
+                    win32gui.SetMenu(hwnd, 0)
+                    win32gui.DestroyMenu(hmenu)
+                    print("Removed window menu")
+            except:
+                pass
+            
+            # Force remove any remaining menu bar
+            try:
+                win32gui.PostMessage(hwnd, win32con.WM_SYSCOMMAND, win32con.SC_RESTORE, 0)
+            except:
+                pass
+            
+            print("Window set to completely borderless and removed from taskbar")
+            
+            # Force window to redraw with new style
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOP,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
+                win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED |
+                win32con.SWP_NOACTIVATE
+            )
+            
+            # Additional pass to ensure window is fully borderless
+            win32gui.SetWindowPos(
+                hwnd,
+                win32con.HWND_TOP,
+                0, 0, 0, 0,
+                win32con.SWP_NOMOVE | win32con.SWP_NOSIZE |
+                win32con.SWP_NOZORDER | win32con.SWP_FRAMECHANGED |
+                win32con.SWP_NOACTIVATE
+            )
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error making window borderless: {e}")
+            import traceback
+            traceback.print_exc()
+            return False
+        
+    def stop_game(self):
+        """Stop the current game and return to menu"""
+        print("Stopping game...")
+        
+        if self.is_capturing:
+            self.is_capturing = False
+            self.window_capture.stop_capture()
+            print("Stopped window capture")
+        
+        if self.xenia_process:
+            try:
+                # Try graceful termination
+                self.xenia_process.terminate()
+                print(f"Sent terminate signal to Xenia (PID: {self.xenia_process.pid})")
+                
+                # Wait a moment
+                time.sleep(0.5)
+                
+                # Check if process ended
+                if self.xenia_process.poll() is None:
+                    print("Xenia didn't terminate, forcing kill...")
+                    self.xenia_process.kill()
+                
+                # Clear references
+                self.xenia_process = None
+                self.xenia_hwnd = None
+                print("Xenia process cleaned up")
+                
+            except Exception as e:
+                print(f"Error stopping Xenia: {e}")
+                self.xenia_process = None
+                self.xenia_hwnd = None
+        
+        # Show menu
+        self.show_menu()
+        print("Returned to menu")
     
     def show_error_popup(self, title, message):
         """Show an error popup dialog"""
@@ -1142,65 +1789,27 @@ class App(ctk.CTk):
                 print(f"Failed to create error placeholder: {e2}")
                 return None
     
-    def check_xenia_processes(self):
-        """Check if any Xenia processes are running"""
-        # List of Xenia executable names to check
-        xenia_exes = ["xenia_canary.exe", "xenia_canary_netplay.exe"]
+    def check_xenia_process(self):
+        """Check if Xenia process is still running"""
+        if not self.xenia_process:
+            return False
         
         try:
-            # Check all processes
-            result = subprocess.run(
-                ['tasklist', '/FI', 'IMAGENAME eq xenia_canary.exe /FI', 'IMAGENAME eq xenia_canary_netplay.exe'],
-                capture_output=True, text=True, shell=True
-            )
-            
-            # Check if any Xenia process is running by looking for the executable names
-            for exe in xenia_exes:
-                if exe in result.stdout:
-                    return True
-            
-            # Also check our stored processes
-            for process in self.xenia_processes[:]:  # Create a copy to safely modify
-                try:
-                    # Check if process is still alive
-                    if process.poll() is not None:
-                        # Process has terminated, remove from list
-                        self.xenia_processes.remove(process)
-                except:
-                    # Process is no longer valid, remove from list
-                    self.xenia_processes.remove(process)
-            
-            return len(self.xenia_processes) > 0
-            
-        except Exception as e:
-            print(f"Error checking Xenia processes: {e}")
-            # Fall back to checking our stored processes
-            return len(self.xenia_processes) > 0
+            return self.xenia_process.poll() is None
+        except:
+            return False
     
     def monitor_xenia_processes(self):
-        """Monitor Xenia processes and update controller input accordingly"""
-        # Check if Xenia is running
-        xenia_running = self.check_xenia_processes()
+        """Monitor Xenia process and handle when it closes"""
+        xenia_running = self.check_xenia_process()
         
-        if xenia_running != self.is_xenia_running:
+        if self.is_xenia_running != xenia_running:
             self.is_xenia_running = xenia_running
             
-            if xenia_running:
-                # Disable controller input
-                self.controller_manager.disable_input()
-                # Update status display
-                self.xenia_status.configure(
-                    text="Xenia: Running (Controller Disabled)",
-                    text_color="#dc2626"  # Red for warning
-                )
-            else:
-                # Enable controller input
-                self.controller_manager.enable_input()
-                # Update status display
-                self.xenia_status.configure(
-                    text="Xenia: Not Running",
-                    text_color="#6b7280"  # Gray for normal
-                )
+            if not xenia_running and self.is_capturing:
+                # Xenia closed while game is displayed
+                print("Xenia process terminated")
+                self.stop_game()
         
         # Schedule next check
         self.after(self.process_check_interval, self.monitor_xenia_processes)
@@ -1225,87 +1834,67 @@ class App(ctk.CTk):
         if current_time - self.last_controller_input_time < self.input_cooldown:
             return
         
-        # Check if controller input is enabled (not disabled by Xenia running)
-        if not self.controller_manager.enabled:
+        # Check if we should process input - ONLY check Start+Back combo when game is running
+        if self.is_capturing:
+            # When game is running, ONLY check for Share+Options combo (Back+Start)
+            buttons = state.get('buttons', {})
+            back_pressed = buttons.get('back', False)
+            start_pressed = buttons.get('start', False)
+            
+            # Check for Share+Options combo (Back+Start) to exit
+            if back_pressed and start_pressed:
+                print("Share+Options pressed - stopping game")
+                self.stop_game()
+                self.last_controller_input_time = current_time
+            # IGNORE ALL OTHER CONTROLLER INPUT WHEN GAME IS RUNNING
             return
         
-        # Check for button presses
+        # Only process menu navigation when game is NOT running
         buttons = state.get('buttons', {})
         axes = state.get('axes', {})
         
         # D-pad/Stick navigation
         dpad_up = buttons.get('dpup', False)
         dpad_down = buttons.get('dpdown', False)
-        dpad_left = buttons.get('dpleft', False)
-        dpad_right = buttons.get('dpright', False)
-        
-        # Stick navigation (with threshold)
         left_stick_up = axes.get('lefty', 0) < -0.5
         left_stick_down = axes.get('lefty', 0) > 0.5
-        left_stick_left = axes.get('leftx', 0) < -0.5
-        left_stick_right = axes.get('leftx', 0) > 0.5
         
-        # Determine navigation direction
         nav_up = dpad_up or left_stick_up
         nav_down = dpad_down or left_stick_down
-        nav_left = dpad_left or left_stick_left
-        nav_right = dpad_right or left_stick_right
         
-        # Handle navigation
         if nav_up:
             self.navigate_focus(-1)
             self.last_controller_input_time = current_time
         elif nav_down:
             self.navigate_focus(1)
             self.last_controller_input_time = current_time
-        elif nav_left and isinstance(self.get_focused_widget(), ctk.CTkComboBox):
-            # Handle combobox navigation
-            current_value = self.selected_hdd_content.get()
-            if current_value in self.hdd_content:
-                current_index = list(self.hdd_content.keys()).index(current_value)
-                if current_index > 0:
-                    self.selected_hdd_content.set(list(self.hdd_content.keys())[current_index - 1])
-                    self.last_controller_input_time = current_time
-        elif nav_right and isinstance(self.get_focused_widget(), ctk.CTkComboBox):
-            # Handle combobox navigation
-            current_value = self.selected_hdd_content.get()
-            if current_value in self.hdd_content:
-                current_index = list(self.hdd_content.keys()).index(current_value)
-                if current_index < len(self.hdd_content) - 1:
-                    self.selected_hdd_content.set(list(self.hdd_content.keys())[current_index + 1])
-                    self.last_controller_input_time = current_time
         
         # Handle A button press (activate)
         if buttons.get('a', False):
             self.activate_focused_widget()
             self.last_controller_input_time = current_time
         
-        # Handle B button press (back/exit) - DISABLED to avoid thread error
-        # if buttons.get('b', False):
-        #     self.quit_app()
-        #     self.last_controller_input_time = current_time
-        
-        # Handle Start button press (launch)
-        if buttons.get('start', False):
+        # Handle Start button press (launch) - only if Back is not pressed
+        if buttons.get('start', False) and not buttons.get('back', False):
             self.launch_selected_rom()
             self.last_controller_input_time = current_time
         
-        # Handle Back button press (set default)
-        if buttons.get('back', False):
+        # Handle Back button press (set default) - only if Start is not pressed
+        if buttons.get('back', False) and not buttons.get('start', False):
             self.set_default_rom()
             self.last_controller_input_time = current_time
-    
+
     def update_controller_display(self):
         """Update controller status display in UI"""
         if self.controller_state.get('connected', False):
             controller_type = self.controller_state.get('type', 'Unknown')
-            status_text = f"Controller: Connected ({controller_type.upper()})"
             
-            # If Xenia is running, show that controller is disabled
-            if self.is_xenia_running:
-                status_text += " (Disabled - Xenia Running)"
-                text_color = "#dc2626"  # Red for warning
+            if self.is_capturing:
+                # When game is running, show that only Start+Back works
+                status_text = f"Controller: Game Running (Start+Back to Exit)"
+                text_color = "#f59e0b"  # Orange for game mode
             else:
+                status_text = f"Controller: Connected ({controller_type.upper()})"
                 text_color = "#10b981"  # Green for connected
                 
             self.controller_status.configure(
@@ -1315,7 +1904,7 @@ class App(ctk.CTk):
         else:
             self.controller_status.configure(
                 text="Controller: Disconnected",
-                text_color="#6b7280"  # Gray for disconnected
+                text_color="#6b7280"
             )
     
     def update_controller_status(self):
@@ -1372,7 +1961,6 @@ class App(ctk.CTk):
                     border_color=style['border_color'],
                     border_width=style['border_width']
                 )
-                # Keep fg_color and text_color as is
             elif isinstance(widget, ctk.CTkComboBox):
                 widget.configure(
                     border_color=style['border_color'],
@@ -1386,7 +1974,7 @@ class App(ctk.CTk):
     
     def highlight_widget(self, widget):
         """Highlight the focused widget with bright yellow border"""
-        highlight_color = "#fbbf24"  # Bright yellow for high visibility
+        highlight_color = "#fbbf24"
         highlight_width = 3
         
         if isinstance(widget, ctk.CTkButton):
@@ -1420,10 +2008,8 @@ class App(ctk.CTk):
         if isinstance(widget, ctk.CTkButton):
             widget.invoke()
         elif isinstance(widget, ctk.CTkComboBox):
-            # For combobox, open dropdown
             widget.focus()
         elif isinstance(widget, ctk.CTkCheckBox):
-            # Toggle checkbox
             current_value = widget.get()
             widget.select() if not current_value else widget.deselect()
     
@@ -1448,10 +2034,46 @@ class App(ctk.CTk):
                 continue
     
     def quit_app(self):
-        """Quit the application"""
-        # Stop controller polling gracefully
-        self.controller_manager.stop_polling()
+        """Quit the application and ensure Xenia is closed"""
+        print("Quitting XDash - cleaning up...")
+        
+        # Stop game if running
+        if self.is_capturing:
+            print("Stopping game capture...")
+            self.is_capturing = False
+            self.window_capture.stop_capture()
+        
+        # Terminate Xenia process if it exists
+        if self.xenia_process:
+            print(f"Terminating Xenia process (PID: {self.xenia_process.pid})...")
+            try:
+                # Try graceful termination first
+                self.xenia_process.terminate()
+                
+                # Wait for process to end (max 3 seconds)
+                for _ in range(30):
+                    if self.xenia_process.poll() is not None:
+                        print("Xenia terminated gracefully")
+                        break
+                    time.sleep(0.1)
+                else:
+                    # Force kill if still running
+                    print("Force killing Xenia process...")
+                    self.xenia_process.kill()
+                    self.xenia_process.wait(timeout=2)
+            except Exception as e:
+                print(f"Error terminating Xenia: {e}")
+            finally:
+                self.xenia_process = None
+                self.xenia_hwnd = None
+        
+        # Stop controller polling
+        if hasattr(self, 'controller_manager'):
+            print("Stopping controller polling...")
+            self.controller_manager.stop_polling()
+        
         # Destroy window
+        print("Destroying window...")
         self.destroy()
 
 

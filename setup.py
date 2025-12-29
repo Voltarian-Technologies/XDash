@@ -22,14 +22,11 @@ setup(
                 "time",
                 "ctypes",
                 "collections",
-
-                # SDL2 / DirectInput
+                "pywin32",
                 "sdl2",
-                "sdl2.ext",
-                "sdl2.joystick",
-
-                # XInput (ctypes already included)
-                "ctypes.wintypes",
+                "sdl2-dll",
+                "numpy",
+                "comtypes"
             ],
             "include_files": [
                 "assets/",

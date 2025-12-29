@@ -1,4 +1,4 @@
 [Config]
 netplay = false
 default_rom = "Dashboard"
-controller_type = "any"  # Options: "any", "sdl", "xinput"
+controller_type = "any"
