@@ -23,8 +23,8 @@ setup(
                 "ctypes",
                 "collections",
                 "pywin32",
-                "sdl2",
-                "sdl2-dll",
+                "pysdl2",
+                "pysdl2-dll",
                 "numpy",
                 "comtypes"
             ],
