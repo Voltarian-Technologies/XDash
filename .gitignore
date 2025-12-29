@@ -1,6 +1,6 @@
 .vscode/
 __pycache__/
 dist/
-Xenia/cache*/
-Xenia/xenia.log
-Xenia/recent.toml
+XDash Online/cache*/
+XDash Online/xenia.log
+XDash Online/recent.toml

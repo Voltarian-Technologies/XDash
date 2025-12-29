@@ -34,7 +34,7 @@ setup(
             "include_files": [
                 "assets/",
                 "docs/",
-                "Xenia/",
+                "XDash Online/",
                 "XDash HDD/",
                 "xdash.config.toml",
                 "README.md",

@@ -723,9 +723,8 @@ class App(ctk.CTk):
         self.window_height = self.window_height
         
         # Define paths relative to script directory
-        self.xenia_dir = self.script_dir / "Xenia"
-        self.normal_exe_path = self.xenia_dir / "xenia_canary.exe"
-        self.netplay_exe_path = self.xenia_dir / "xenia_canary_netplay.exe"
+        self.xdash_online_dir = self.script_dir / "XDash Online"
+        self.exe_path = self.xdash_online_dir / "xenia_canary_netplay.exe"
         self.hdd_storage = self.script_dir / "XDash HDD"
         self.json_path = self.hdd_storage / "layout.json"
         self.assets_dir = self.script_dir / "assets"
@@ -740,7 +739,7 @@ class App(ctk.CTk):
             print(f"Icon file not found: {self.logo_bitmap_path}")
         
         # Store the current executable path
-        self.current_exe_path = self.normal_exe_path
+        self.current_exe_path = self.exe_path
         
         # Configure grid layout (4x4) for better responsiveness
         self.grid_columnconfigure((0, 1, 2, 3), weight=1)
@@ -774,9 +773,6 @@ class App(ctk.CTk):
         # Store the selected HDD content
         self.selected_hdd_content = tk.StringVar()
         
-        # Netplay mode variable
-        self.netplay_mode = tk.BooleanVar(value=self.config.get('netplay', False))
-        
         # Track Xenia processes
         self.xenia_process = None
         self.xenia_hwnd = None
@@ -790,9 +786,6 @@ class App(ctk.CTk):
         # UI elements
         self.game_display = None
         self.menu_container = None
-        
-        # Apply initial executable mode from config BEFORE creating widgets
-        self.apply_initial_exe_mode()
         
         # Create all widgets and components
         self.create_widgets()
@@ -821,7 +814,6 @@ class App(ctk.CTk):
     def load_config(self):
         """Load configuration from TOML file"""
         default_config = {
-            'netplay': False,
             'default_rom': '',
             'controller_type': 'any'
         }
@@ -836,7 +828,6 @@ class App(ctk.CTk):
                 
                 # Merge with defaults
                 loaded_config = {
-                    'netplay': config_section.get('netplay', default_config['netplay']),
                     'default_rom': config_section.get('default_rom', default_config['default_rom']),
                     'controller_type': config_section.get('controller_type', default_config['controller_type'])
                 }
@@ -857,7 +848,6 @@ class App(ctk.CTk):
         """Save configuration to TOML file"""
         if config is None:
             config = {
-                'netplay': self.netplay_mode.get(),
                 'default_rom': self.selected_hdd_content.get(),
                 'controller_type': self.config.get('controller_type', 'any')
             }
@@ -866,7 +856,6 @@ class App(ctk.CTk):
             # Create TOML structure
             toml_data = {
                 'Config': {
-                    'netplay': config['netplay'],
                     'default_rom': config['default_rom'],
                     'controller_type': config['controller_type']
                 }
@@ -1028,7 +1017,7 @@ class App(ctk.CTk):
                  '  "Content Name": "path/to/dash.xex",\n' +
                  '  "Another Content Name": "another/path.xex"\n' +
                  "}\n\n" +
-                 f"xenia_canary.exe location: {self.normal_exe_path}",
+                 f"xenia_canary.exe location: {self.exe_path}",
             text_color="#555555",
             font=("Arial", 12),
             justify="left",
@@ -1079,9 +1068,6 @@ class App(ctk.CTk):
         # Content selection row
         self.create_rom_selection_row()
         
-        # Mode selection checkboxes
-        self.create_mode_checkboxes()
-        
         # Launch Button
         self.launchButton = ctk.CTkButton(
             self.selectionFrame,
@@ -1111,7 +1097,6 @@ class App(ctk.CTk):
         self.focusable_widgets = [
             self.contentDropdown,
             self.setDefaultButtonTop,
-            self.netplayCheckbox,
             self.launchButton
         ]
         
@@ -1193,31 +1178,6 @@ class App(ctk.CTk):
                     self.config['default_rom'] = first_dashboard
                     self.save_config()
     
-    def create_mode_checkboxes(self):
-        """Create the mode selection checkboxes"""
-        # Netplay Mode Checkbox
-        self.netplayCheckbox = ctk.CTkCheckBox(
-            self.selectionFrame,
-            text="Enable Netplay Mode (Experimental)",
-            variable=self.netplay_mode,
-            command=self.toggle_exe_mode,
-            font=("Arial", 14),
-            text_color="#374151",
-            fg_color="#3b82f6",
-            hover_color="#2563eb",
-            border_width=2,
-            border_color="#d1d5db",
-            corner_radius=6
-        )
-        self.netplayCheckbox.place(x=30, y=150)
-        
-        # Store original style
-        self.widget_styles[self.netplayCheckbox] = {
-            'border_color': "#d1d5db",
-            'border_width': 2,
-            'fg_color': "#3b82f6"
-        }
-    
     def set_default_rom(self):
         """Set the currently selected HDD content as default"""
         selected = self.selected_hdd_content.get()
@@ -1225,37 +1185,6 @@ class App(ctk.CTk):
             self.config['default_rom'] = selected
             if self.save_config():
                 print(f"Set default HDD content to: {selected}")
-    
-    def apply_initial_exe_mode(self):
-        """Apply the initial executable mode based on config (called before creating widgets)"""
-        if self.config.get('netplay', False):
-            self.current_exe_path = self.netplay_exe_path
-            mode_name = "Netplay"
-        else:
-            self.current_exe_path = self.normal_exe_path
-            mode_name = "Normal"
-        
-        print(f"Initial mode: {mode_name}, Using executable: {self.current_exe_path.name}")
-    
-    def toggle_exe_mode(self):
-        """Toggle between normal and netplay executables"""
-        # Apply the selected mode
-        self.apply_exe_mode()
-        
-        # Update config
-        self.config['netplay'] = self.netplay_mode.get()
-        self.save_config()
-    
-    def apply_exe_mode(self):
-        """Apply the current executable mode based on checkbox states"""
-        if self.netplay_mode.get():
-            self.current_exe_path = self.netplay_exe_path
-            mode_name = "Netplay"
-        else:
-            self.current_exe_path = self.normal_exe_path
-            mode_name = "Normal"
-        
-        print(f"Mode: {mode_name}, Using executable: {self.current_exe_path.name}")
     
     def retry_load_hdd_content(self):
         """Retry loading HDD Content and refresh the UI"""
@@ -1410,11 +1339,11 @@ class App(ctk.CTk):
         selected_rom_path = self.hdd_storage / selected_rom
         
         # Check if the executable exists
-        if not self.current_exe_path.exists():
-            error_msg = f"Executable not found: {self.current_exe_path}"
+        if not self.exe_path.exists():
+            error_msg = f"Executable not found: {self.exe_path}"
             print(error_msg)
             self.show_error_popup("Executable Not Found", 
-                                 f"Cannot find:\n{self.current_exe_path}\n\nPlease ensure the Xenia directory contains the required executable.")
+                                 f"Cannot find:\n{self.exe_path}\n\nPlease ensure the Xenia directory contains the required executable.")
             return
         
         # Check if the HDD content file exists
@@ -1426,7 +1355,7 @@ class App(ctk.CTk):
             return
         
         print(f"Launching: {selected_name}")
-        print(f"Executable: {self.current_exe_path}")
+        print(f"Executable: {self.exe_path}")
         print(f"Content: {selected_rom_path}")
         
         try:
@@ -1435,7 +1364,7 @@ class App(ctk.CTk):
             
             # Launch Xenia process
             self.xenia_process = subprocess.Popen(
-                [str(self.current_exe_path), str(selected_rom_path)],
+                [str(self.exe_path), str(selected_rom_path)],
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
             
